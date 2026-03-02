@@ -1,0 +1,26 @@
+services:
+  zai-openai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zai-openai:local
+    container_name: zai-openai
+    working_dir: /app
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=DEBUG
+      - HTTP_DEBUG=0
+      - ENABLE_THINKING=1
+      - UPSTREAM_FIRST_EVENT_TIMEOUT=60
+      - UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX=2
+      - TOKEN_MAX_AGE=480
+      - POOL_MIN_SIZE=5
+      - POOL_MAX_SIZE=24
+      - POOL_TARGET_INFLIGHT_PER_ACCOUNT=2
+      - POOL_MAINTAIN_INTERVAL=10
+      - POOL_SCALE_DOWN_IDLE_ROUNDS=3
+    volumes:
+      - ./:/app
+    command: ["python", "openai.py"]
+    ports:
+      - "30016:30016"
