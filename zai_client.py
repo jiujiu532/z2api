@@ -19,7 +19,7 @@ import httpx
 logger = logging.getLogger("zai.client")
 
 BASE_URL = "https://chat.z.ai"
-HMAC_SECRET = "key-@@@@)))()((9))-xxxx&&&%%%%%"
+HMAC_SECRET = os.getenv("HMAC_SECRET", "key-@@@@)))()((9))-xxxx&&&&%%%%%")
 FE_VERSION = "prod-fe-1.0.231"
 CLIENT_VERSION = "0.0.1"
 DEFAULT_MODEL = "glm-5"
@@ -30,40 +30,97 @@ USER_AGENT = (
     "Chrome/144.0.0.0 Safari/537.36"
 )
 
+# ── Shared Connection Pool ──────────────────────────────────────────
+# All ZaiClient instances reuse ONE httpx.AsyncClient, avoiding the
+# TCP/TLS handshake cost per request.  HTTP/2 multiplexing lets many
+# concurrent streams share a single connection.
+
+_shared_client: httpx.AsyncClient | None = None
+_shared_client_lock = asyncio.Lock()
+
+_TIMEOUT = httpx.Timeout(
+    connect=10.0,     # 连接超时（含 TLS 握手）
+    read=180.0,       # 读取超时 — 长文生成需要
+    write=10.0,       # 写入超时
+    pool=10.0,        # 连接池获取超时
+)
+
+_LIMITS = httpx.Limits(
+    max_keepalive_connections=20,    # 保活连接数
+    max_connections=60,              # 最大并发连接数（支持 30 并发）
+    keepalive_expiry=120,            # 保活超时 2 分钟
+)
+
+_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept-Language": "zh-CN",
+    "Referer": f"{BASE_URL}/",
+    "Origin": BASE_URL,
+}
+
+
+async def _get_shared_client() -> httpx.AsyncClient:
+    """Get or create the shared httpx client (thread-safe via lock)."""
+    global _shared_client
+    if _shared_client is not None and not _shared_client.is_closed:
+        return _shared_client
+    async with _shared_client_lock:
+        if _shared_client is not None and not _shared_client.is_closed:
+            return _shared_client
+        try:
+            import httpx as _httpx
+            # 尝试启用 HTTP/2 多路复用（需要 pip install httpx[http2]）
+            _shared_client = _httpx.AsyncClient(
+                base_url=BASE_URL,
+                timeout=_TIMEOUT,
+                limits=_LIMITS,
+                headers=_HEADERS,
+                http2=True,
+            )
+            logger.info("Shared HTTP client created with HTTP/2 enabled")
+        except Exception:
+            # 如果 h2 没装，退回 HTTP/1.1
+            _shared_client = httpx.AsyncClient(
+                base_url=BASE_URL,
+                timeout=_TIMEOUT,
+                limits=_LIMITS,
+                headers=_HEADERS,
+                http2=False,
+            )
+            logger.info("Shared HTTP client created with HTTP/1.1 (install httpx[http2] for H2)")
+        return _shared_client
+
+
+async def close_shared_pool() -> None:
+    """Shut down the shared connection pool. Call once at app shutdown."""
+    global _shared_client
+    async with _shared_client_lock:
+        if _shared_client is not None:
+            await _shared_client.aclose()
+            _shared_client = None
+            logger.info("Shared HTTP client closed")
+
 
 class ZaiClient:
     def __init__(self) -> None:
-        # 分离超时配置：connect快速失败，read支持长时间流式响应
-        timeout_config = httpx.Timeout(
-            connect=5.0,      # 连接超时 5秒
-            read=180.0,       # 读取超时 3分钟（支持长文生成）
-            write=10.0,       # 写入超时 10秒
-            pool=5.0,         # 连接池获取超时 5秒
-        )
-        self.client = httpx.AsyncClient(
-            base_url=BASE_URL,
-            timeout=timeout_config,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "zh-CN",
-                "Referer": f"{BASE_URL}/",
-                "Origin": BASE_URL,
-            },
-            # 限制连接池大小，避免连接泄漏
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-        )
         self.token: str | None = None
         self.user_id: str | None = None
         self.username: str | None = None
 
+    async def _http(self) -> httpx.AsyncClient:
+        """Return the shared HTTP client."""
+        return await _get_shared_client()
+
     async def close(self) -> None:
-        await self.client.aclose()
+        """No-op — shared pool is managed globally, not per-client."""
+        pass
 
     # ── auth ────────────────────────────────────────────────────────
 
     async def auth_as_guest(self) -> dict:
         """GET /api/v1/auths/ — creates a guest session and returns user info."""
-        resp = await self.client.get(
+        client = await self._http()
+        resp = await client.get(
             "/api/v1/auths/",
             headers={"Content-Type": "application/json"},
         )
@@ -78,7 +135,8 @@ class ZaiClient:
 
     async def get_models(self) -> list:
         """GET /api/models — returns available model list."""
-        resp = await self.client.get(
+        client = await self._http()
+        resp = await client.get(
             "/api/models",
             headers={
                 "Content-Type": "application/json",
@@ -155,7 +213,8 @@ class ZaiClient:
                 "timestamp": int(time.time() * 1000),
             }
         }
-        resp = await self.client.post(
+        client = await self._http()
+        resp = await client.post(
             "/api/v1/chats/new",
             headers={
                 "Content-Type": "application/json",
@@ -182,14 +241,13 @@ class ZaiClient:
         This should be called after each request to free up concurrency slots.
         """
         try:
-            resp = await self.client.delete(
+            client = await self._http()
+            resp = await client.delete(
                 f"/api/v1/chats/{chat_id}",
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json",
-                    **({
-                        "Authorization": f"Bearer {self.token}"
-                    } if self.token else {}),
+                    **({"Authorization": f"Bearer {self.token}"} if self.token else {}),
                 },
             )
             if resp.status_code == 200:
@@ -209,14 +267,13 @@ class ZaiClient:
         Useful for cleaning up accumulated chats when hitting concurrency limits.
         """
         try:
-            resp = await self.client.delete(
+            client = await self._http()
+            resp = await client.delete(
                 "/api/v1/chats/",
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json",
-                    **({
-                        "Authorization": f"Bearer {self.token}"
-                    } if self.token else {}),
+                    **({"Authorization": f"Bearer {self.token}"} if self.token else {}),
                 },
             )
             if resp.status_code == 200:
@@ -412,7 +469,8 @@ class ZaiClient:
 
         url = f"{BASE_URL}/api/v2/chat/completions?{query_string}"
 
-        async with self.client.stream(
+        client = await self._http()
+        async with client.stream(
             "POST", url, headers=headers, json=body,
         ) as resp:
             if resp.status_code != 200:
@@ -497,7 +555,7 @@ async def main() -> None:
         print("\n\n[done]")
 
     finally:
-        await client.close()
+        await close_shared_pool()
 
 
 if __name__ == "__main__":

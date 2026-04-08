@@ -21,8 +21,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from main import ZaiClient
-from claude_compat import (
+from zai_client import ZaiClient, close_shared_pool
+from claude_adapter import (
     claude_messages_to_openai,
     claude_tools_to_openai,
     claude_tool_choice_prompt,
@@ -64,6 +64,9 @@ POOL_SCALE_DOWN_IDLE_ROUNDS = max(1, int(os.getenv("POOL_SCALE_DOWN_IDLE_ROUNDS"
 TOKEN_MAX_AGE = int(os.getenv("TOKEN_MAX_AGE", "480"))  # seconds
 UPSTREAM_FIRST_EVENT_TIMEOUT = max(1.0, float(os.getenv("UPSTREAM_FIRST_EVENT_TIMEOUT", "60")))
 UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX = max(0, int(os.getenv("UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX", "2")))
+MAX_STREAM_RETRIES = max(1, int(os.getenv("MAX_STREAM_RETRIES", "3")))
+GLOBAL_CONCURRENCY_LIMIT = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", str(POOL_MAX_SIZE * POOL_TARGET_INFLIGHT_PER_ACCOUNT)))
+_global_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY_LIMIT)
 
 
 def _compute_pool_target_by_load(in_flight: int) -> int:
@@ -105,6 +108,7 @@ class SessionPool:
         self._maintain_event = asyncio.Event()
         self._target_size = POOL_MIN_SIZE
         self._idle_rounds = 0
+        self._cleanup_running = False
 
     # ── internal ─────────────────────────────────────────────────────
 
@@ -193,19 +197,22 @@ class SessionPool:
                 for a in to_delete:
                     asyncio.create_task(self._del_account(a))
 
-                for _ in range(to_add):
-                    try:
-                        new_acc = await self._new_account()
-                    except Exception as e:
-                        logger.warning("Pool maintain add failed: %s", e)
-                        break
-
+                if to_add > 0:
+                    # 并发创建账号，加速扩容
+                    results = await asyncio.gather(
+                        *[self._new_account() for _ in range(to_add)],
+                        return_exceptions=True,
+                    )
                     async with self._lock:
-                        valid_now = len(self._valid_accounts())
-                        if valid_now >= cycle_target:
-                            asyncio.create_task(self._del_account(new_acc))
-                            continue
-                        self._accounts.append(new_acc)
+                        for r in results:
+                            if isinstance(r, AccountInfo):
+                                valid_now = len(self._valid_accounts())
+                                if valid_now >= cycle_target:
+                                    asyncio.create_task(self._del_account(r))
+                                else:
+                                    self._accounts.append(r)
+                            else:
+                                logger.warning("Pool maintain add failed: %s", r)
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -243,20 +250,27 @@ class SessionPool:
         self._accounts.clear()
 
     async def acquire(self) -> AccountInfo:
-        """Get the least-busy valid account (creates one if needed)."""
-        good = self._valid_accounts()
-        if not good:
-            async with self._lock:
-                good = self._valid_accounts()
-                if not good:
-                    acc = await self._new_account()
-                    self._accounts.append(acc)
-                    good = [acc]
-        acc = min(good, key=lambda a: a.active)
-        acc.active += 1
-        if acc.active >= POOL_TARGET_INFLIGHT_PER_ACCOUNT:
-            self._raise_target_size(len(good) + 1)
-        return acc
+        """Get the least-busy valid account (creates one if needed). Thread-safe."""
+        async with self._lock:
+            good = self._valid_accounts()
+            if not good:
+                acc = await self._new_account()
+                self._accounts.append(acc)
+                good = [acc]
+            acc = min(good, key=lambda a: a.active)
+            acc.active += 1
+            if acc.active >= POOL_TARGET_INFLIGHT_PER_ACCOUNT:
+                self._raise_target_size(len(good) + 1)
+            return acc
+
+    @asynccontextmanager
+    async def borrow(self):
+        """Context manager: acquire an account and auto-release on exit."""
+        acc = await self.acquire()
+        try:
+            yield acc
+        finally:
+            self.release(acc)
 
     def release(self, acc: AccountInfo) -> None:
         acc.active = max(0, acc.active - 1)
@@ -349,16 +363,29 @@ class SessionPool:
         self._maintain_event.set()
 
     async def cleanup_chats(self) -> None:
-        """Clean up chats for idle accounts to free concurrency slots."""
-        for a in list(self._accounts):
-            if a.valid and a.active == 0:
+        """Clean up chats for idle accounts to free concurrency slots (concurrent)."""
+        if self._cleanup_running:
+            return
+        self._cleanup_running = True
+        try:
+            async def _clean_one(a: AccountInfo) -> None:
                 try:
                     c = ZaiClient()
                     c.token, c.user_id, c.username = a.token, a.user_id, a.username
                     await c.delete_all_chats()
-                    await c.close()
                 except Exception:
                     pass
+
+            targets = [a for a in list(self._accounts) if a.valid and a.active == 0]
+            if targets:
+                await asyncio.wait_for(
+                    asyncio.gather(*[_clean_one(a) for a in targets], return_exceptions=True),
+                    timeout=15.0,
+                )
+        except asyncio.TimeoutError:
+            logger.warning("cleanup_chats timed out after 15s")
+        finally:
+            self._cleanup_running = False
 
 
 pool = SessionPool()
@@ -369,6 +396,7 @@ async def lifespan(_app: FastAPI):
     await pool.initialize()
     yield
     await pool.close()
+    await close_shared_pool()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -852,6 +880,17 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    if _global_semaphore.locked():
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": f"Server at capacity ({GLOBAL_CONCURRENCY_LIMIT} concurrent requests). Retry later.", "type": "rate_limit_error"}},
+            headers={"Retry-After": "3"},
+        )
+    async with _global_semaphore:
+        return await _chat_completions_inner(request)
+
+
+async def _chat_completions_inner(request: Request):
     body = await request.json()
 
     model: str = body.get("model", "glm-5")
@@ -925,8 +964,7 @@ async def chat_completions(request: Request):
 
         async def gen_sse():
             completion_id = _make_id()
-            retried = False
-            first_event_timeout_retries = 0
+            retry_count = 0
             empty_reply_retries = 0
             current_uid: str | None = None
             role_emitted = False
@@ -1081,111 +1119,97 @@ async def chat_completions(request: Request):
 
                 except asyncio.TimeoutError:
                     logger.error(
-                        "[stream][%s] first upstream event timeout: %.1fs",
-                        completion_id,
-                        UPSTREAM_FIRST_EVENT_TIMEOUT,
+                        "[stream][%s] first upstream event timeout: %.1fs (retry %d/%d)",
+                        completion_id, UPSTREAM_FIRST_EVENT_TIMEOUT, retry_count, MAX_STREAM_RETRIES,
                     )
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
                         await client.close()
                         client = None
-                    if first_event_timeout_retries >= UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX:
+                    retry_count += 1
+                    if retry_count >= MAX_STREAM_RETRIES:
                         yield f"data: {json.dumps({'error': {'message': 'Upstream first event timeout after retry', 'type': 'timeout_error'}}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    first_event_timeout_retries += 1
-                    logger.info(
-                        "[stream][%s] retrying after first-event timeout... (%d/%d)",
-                        completion_id,
-                        first_event_timeout_retries,
-                        UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX,
-                    )
+                    logger.info("[stream][%s] retrying after timeout... (%d/%d)", completion_id, retry_count, MAX_STREAM_RETRIES)
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
                 except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
-                    logger.error("[stream][%s] server disconnected: %s", completion_id, e)
+                    logger.error("[stream][%s] server disconnected (retry %d/%d): %s", completion_id, retry_count, MAX_STREAM_RETRIES, e)
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
                         await client.close()
                         client = None
-                    if retried:
+                    retry_count += 1
+                    if retry_count >= MAX_STREAM_RETRIES:
                         error_msg = "上游服务断开连接，请稍后重试"
                         yield f"data: {json.dumps(_openai_chunk(completion_id, model, content=f'[{error_msg}]'), ensure_ascii=False)}\n\n"
                         yield f"data: {json.dumps(_openai_chunk(completion_id, model, finish_reason='error'), ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    retried = True
-                    logger.info("[stream][%s] switching account and retrying...", completion_id)
+                    logger.info("[stream][%s] switching account and retrying... (%d/%d)", completion_id, retry_count, MAX_STREAM_RETRIES)
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
                 except (httpcore.ReadTimeout, httpx.ReadTimeout) as e:
-                    logger.error("[stream][%s] read timeout: %s", completion_id, e)
+                    logger.error("[stream][%s] read timeout (retry %d/%d): %s", completion_id, retry_count, MAX_STREAM_RETRIES, e)
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
                         await client.close()
                         client = None
-                    
-                    if retried:
+                    retry_count += 1
+                    if retry_count >= MAX_STREAM_RETRIES:
                         error_msg = "上游服务响应超时，请稍后重试或减少消息长度"
                         yield f"data: {json.dumps(_openai_chunk(completion_id, model, content=f'[{error_msg}]'), ensure_ascii=False)}\n\n"
                         yield f"data: {json.dumps(_openai_chunk(completion_id, model, finish_reason='error'), ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    
-                    retried = True
-                    logger.info("[stream][%s] retrying after timeout...", completion_id)
+                    logger.info("[stream][%s] retrying after read timeout... (%d/%d)", completion_id, retry_count, MAX_STREAM_RETRIES)
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
                 except httpx.HTTPStatusError as e:
-                    # Handle upstream 400 with concurrency limit (code 429)
                     is_concurrency = False
                     try:
                         err_body = e.response.json() if e.response else {}
                         is_concurrency = err_body.get("code") == 429
                     except Exception:
                         pass
-                    
-                    logger.error("[stream][%s] HTTP %s (concurrency=%s): %s", completion_id, e.response.status_code if e.response else '?', is_concurrency, e)
+                    logger.error("[stream][%s] HTTP %s (concurrency=%s, retry %d/%d): %s", completion_id, e.response.status_code if e.response else '?', is_concurrency, retry_count, MAX_STREAM_RETRIES, e)
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
                         await client.close()
                         client = None
-                    
-                    if retried:
+                    retry_count += 1
+                    if retry_count >= MAX_STREAM_RETRIES:
                         yield f"data: {json.dumps({'error': {'message': 'Upstream concurrency limit' if is_concurrency else 'Upstream error after retry', 'type': 'server_error'}}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    
-                    retried = True
                     if is_concurrency:
                         logger.info("[stream][%s] concurrency limit hit, cleaning up chats...", completion_id)
                         await pool.cleanup_chats()
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(min(2 ** retry_count, 4))  # exponential backoff, max 4s
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
                 except Exception as e:
-                    logger.exception("[stream][%s] exception: %s", completion_id, e)
+                    logger.exception("[stream][%s] exception (retry %d/%d): %s", completion_id, retry_count, MAX_STREAM_RETRIES, e)
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
                         await client.close()
                         client = None
-                    
-                    if retried:
+                    retry_count += 1
+                    if retry_count >= MAX_STREAM_RETRIES:
                         yield f"data: {json.dumps({'error': {'message': 'Upstream Zai error after retry', 'type': 'server_error'}}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    
-                    retried = True
-                    logger.info("[stream][%s] refreshing auth and retrying...", completion_id)
+                    logger.info("[stream][%s] refreshing auth and retrying... (%d/%d)", completion_id, retry_count, MAX_STREAM_RETRIES)
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
@@ -1403,6 +1427,17 @@ async def chat_completions(request: Request):
 @app.post("/v1/messages")
 async def claude_messages(request: Request):
     """Anthropic Claude Messages API compatible endpoint for new-api."""
+    if _global_semaphore.locked():
+        return JSONResponse(
+            status_code=429,
+            content={"type": "error", "error": {"type": "rate_limit_error", "message": f"Server at capacity ({GLOBAL_CONCURRENCY_LIMIT} concurrent). Retry later."}},
+            headers={"Retry-After": "3"},
+        )
+    async with _global_semaphore:
+        return await _claude_messages_inner(request)
+
+
+async def _claude_messages_inner(request: Request):
     body = await request.json()
     model: str = body.get("model", "glm-5")
     claude_msgs: list[dict] = body.get("messages", [])
@@ -1470,7 +1505,7 @@ async def claude_messages(request: Request):
 
 async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
     """Generator for Claude SSE streaming."""
-    retried = False
+    retry_count = 0
     current_uid: str | None = None
     started = False
     while True:
@@ -1593,30 +1628,30 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
             return
 
         except (httpcore.ReadTimeout, httpx.ReadTimeout) as e:
-            logger.error("[claude-stream][%s] timeout: %s", msg_id, e)
+            logger.error("[claude-stream][%s] timeout (retry %d/%d): %s", msg_id, retry_count, MAX_STREAM_RETRIES, e)
             if client:
                 if chat_id:
                     await client.delete_chat(chat_id)
                 await client.close()
                 client = None
-            if retried:
-                yield sse_error("overloaded_error", "Upstream timeout")
+            retry_count += 1
+            if retry_count >= MAX_STREAM_RETRIES:
+                yield sse_error("overloaded_error", "Upstream timeout after retries")
                 return
-            retried = True
             await pool.refresh_auth(current_uid)
             current_uid = None
             continue
         except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
-            logger.error("[claude-stream][%s] server disconnected: %s", msg_id, e)
+            logger.error("[claude-stream][%s] server disconnected (retry %d/%d): %s", msg_id, retry_count, MAX_STREAM_RETRIES, e)
             if client:
                 if chat_id:
                     await client.delete_chat(chat_id)
                 await client.close()
                 client = None
-            if retried:
-                yield sse_error("api_error", "Server disconnected, please retry")
+            retry_count += 1
+            if retry_count >= MAX_STREAM_RETRIES:
+                yield sse_error("api_error", "Server disconnected after retries")
                 return
-            retried = True
             await pool.refresh_auth(current_uid)
             current_uid = None
             continue
@@ -1627,34 +1662,34 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 is_concurrency = err_body.get("code") == 429
             except Exception:
                 pass
-            logger.error("[claude-stream][%s] HTTP %s (concurrency=%s): %s", msg_id, e.response.status_code if e.response else '?', is_concurrency, e)
+            logger.error("[claude-stream][%s] HTTP %s (concurrency=%s, retry %d/%d): %s", msg_id, e.response.status_code if e.response else '?', is_concurrency, retry_count, MAX_STREAM_RETRIES, e)
             if client:
                 if chat_id:
                     await client.delete_chat(chat_id)
                 await client.close()
                 client = None
-            if retried:
-                yield sse_error("overloaded_error" if is_concurrency else "api_error", "Upstream concurrency limit" if is_concurrency else "Upstream error after retry")
+            retry_count += 1
+            if retry_count >= MAX_STREAM_RETRIES:
+                yield sse_error("overloaded_error" if is_concurrency else "api_error", "Upstream concurrency limit" if is_concurrency else "Upstream error after retries")
                 return
-            retried = True
             if is_concurrency:
                 logger.info("[claude-stream][%s] concurrency limit hit, cleaning up chats...", msg_id)
                 await pool.cleanup_chats()
-                await asyncio.sleep(1)
+                await asyncio.sleep(min(2 ** retry_count, 4))
             await pool.refresh_auth(current_uid)
             current_uid = None
             continue
         except Exception as e:
-            logger.exception("[claude-stream][%s] error: %s", msg_id, e)
+            logger.exception("[claude-stream][%s] error (retry %d/%d): %s", msg_id, retry_count, MAX_STREAM_RETRIES, e)
             if client:
                 if chat_id:
                     await client.delete_chat(chat_id)
                 await client.close()
                 client = None
-            if retried:
-                yield sse_error("api_error", "Upstream error after retry")
+            retry_count += 1
+            if retry_count >= MAX_STREAM_RETRIES:
+                yield sse_error("api_error", "Upstream error after retries")
                 return
-            retried = True
             await pool.refresh_auth(current_uid)
             current_uid = None
             continue
@@ -1673,7 +1708,7 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
     client = None
     chat_id = None
     current_uid: str | None = None
-    for attempt in range(2):
+    for attempt in range(MAX_STREAM_RETRIES):
         try:
             await pool.ensure_auth()
             auth = pool.get_auth_snapshot()
@@ -1755,6 +1790,31 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
                 current_uid = None
 
     return JSONResponse(status_code=500, content={"type": "error", "error": {"type": "api_error", "message": "Unexpected"}})
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint exposing pool status."""
+    valid = pool._valid_accounts()
+    all_accs = [a for a in pool._accounts if a.valid]
+    in_flight = sum(a.active for a in valid)
+    return {
+        "status": "ok",
+        "pool": {
+            "valid_accounts": len(valid),
+            "total_accounts": len(all_accs),
+            "in_flight": in_flight,
+            "target_size": pool._target_size,
+            "config": {
+                "min": POOL_MIN_SIZE,
+                "max": POOL_MAX_SIZE,
+                "inflight_per_account": POOL_TARGET_INFLIGHT_PER_ACCOUNT,
+                "max_retries": MAX_STREAM_RETRIES,
+                "concurrency_limit": GLOBAL_CONCURRENCY_LIMIT,
+            },
+        },
+        "semaphore_available": _global_semaphore._value,
+    }
 
 
 if __name__ == "__main__":

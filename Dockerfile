@@ -8,8 +8,8 @@ WORKDIR /app
 COPY . /app
 
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir fastapi uvicorn httpx httpcore
+    && pip install --no-cache-dir fastapi uvicorn "httpx[http2]" httpcore h2
 
 EXPOSE 30016
 
-CMD ["python", "openai.py"]
+CMD ["python", "server.py"]

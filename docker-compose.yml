@@ -15,12 +15,14 @@ services:
       - UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX=2
       - TOKEN_MAX_AGE=480
       - POOL_MIN_SIZE=5
-      - POOL_MAX_SIZE=24
+      - POOL_MAX_SIZE=72
       - POOL_TARGET_INFLIGHT_PER_ACCOUNT=2
       - POOL_MAINTAIN_INTERVAL=10
       - POOL_SCALE_DOWN_IDLE_ROUNDS=3
+      - MAX_STREAM_RETRIES=3
+      - GLOBAL_CONCURRENCY_LIMIT=96
     volumes:
       - ./:/app
-    command: ["python", "openai.py"]
+    command: ["python", "server.py"]
     ports:
       - "30016:30016"
