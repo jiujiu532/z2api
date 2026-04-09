@@ -40,15 +40,15 @@ _shared_client_lock = asyncio.Lock()
 
 _TIMEOUT = httpx.Timeout(
     connect=10.0,     # 连接超时（含 TLS 握手）
-    read=180.0,       # 读取超时 — 长文生成需要
-    write=10.0,       # 写入超时
-    pool=10.0,        # 连接池获取超时
+    read=600.0,       # 读取超时 — 200K token 输入需要很长生成时间
+    write=30.0,       # 写入超时 — 大 payload 需要更长
+    pool=30.0,        # 连接池获取超时 — 高并发下等更久
 )
 
 _LIMITS = httpx.Limits(
-    max_keepalive_connections=20,    # 保活连接数
-    max_connections=60,              # 最大并发连接数（支持 30 并发）
-    keepalive_expiry=120,            # 保活超时 2 分钟
+    max_keepalive_connections=30,    # 保活连接数（4C4G 足够）
+    max_connections=100,             # 最大并发连接数
+    keepalive_expiry=300,            # 保活超时 5 分钟
 )
 
 _HEADERS = {

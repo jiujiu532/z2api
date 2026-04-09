@@ -62,10 +62,11 @@ POOL_TARGET_INFLIGHT_PER_ACCOUNT = max(1, int(os.getenv("POOL_TARGET_INFLIGHT_PE
 POOL_MAINTAIN_INTERVAL = max(5, int(os.getenv("POOL_MAINTAIN_INTERVAL", "10")))
 POOL_SCALE_DOWN_IDLE_ROUNDS = max(1, int(os.getenv("POOL_SCALE_DOWN_IDLE_ROUNDS", "3")))
 TOKEN_MAX_AGE = int(os.getenv("TOKEN_MAX_AGE", "480"))  # seconds
-UPSTREAM_FIRST_EVENT_TIMEOUT = max(1.0, float(os.getenv("UPSTREAM_FIRST_EVENT_TIMEOUT", "60")))
-UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX = max(0, int(os.getenv("UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX", "2")))
-MAX_STREAM_RETRIES = max(1, int(os.getenv("MAX_STREAM_RETRIES", "3")))
+UPSTREAM_FIRST_EVENT_TIMEOUT = max(1.0, float(os.getenv("UPSTREAM_FIRST_EVENT_TIMEOUT", "120")))
+UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX = max(0, int(os.getenv("UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX", "5")))
+MAX_STREAM_RETRIES = max(1, int(os.getenv("MAX_STREAM_RETRIES", "5")))
 GLOBAL_CONCURRENCY_LIMIT = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", str(POOL_MAX_SIZE * POOL_TARGET_INFLIGHT_PER_ACCOUNT)))
+SSE_HEARTBEAT_INTERVAL = float(os.getenv("SSE_HEARTBEAT_INTERVAL", "15"))  # seconds
 _global_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY_LIMIT)
 
 
@@ -966,6 +967,8 @@ async def _chat_completions_inner(request: Request):
             completion_id = _make_id()
             retry_count = 0
             empty_reply_retries = 0
+            disconnect_retries = 0
+            last_heartbeat = time.perf_counter()
             current_uid: str | None = None
             role_emitted = False
 
@@ -991,6 +994,11 @@ async def _chat_completions_inner(request: Request):
                     native_tool_calls: list[dict] = []
 
                     async for data in _iter_upstream_with_first_event_timeout(upstream, UPSTREAM_FIRST_EVENT_TIMEOUT):
+                        # SSE heartbeat: prevent intermediate proxies from closing idle connections
+                        now_hb = time.perf_counter()
+                        if now_hb - last_heartbeat >= SSE_HEARTBEAT_INTERVAL:
+                            yield ": keepalive\n\n"
+                            last_heartbeat = now_hb
                         if not first_event_logged:
                             first_upstream_elapsed = time.perf_counter() - first_upstream_started
                             logger.info(
@@ -1069,8 +1077,9 @@ async def _chat_completions_inner(request: Request):
                             yield "data: [DONE]\n\n"
                             return
                         empty_reply_retries += 1
+                        # empty reply 不消耗主重试预算，单独计数
                         logger.warning(
-                            "[stream][%s] empty upstream reply, retrying... (%d/%d)",
+                            "[stream][%s] empty upstream reply, switching account... (%d/%d)",
                             completion_id,
                             empty_reply_retries,
                             UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX,
@@ -1137,20 +1146,21 @@ async def _chat_completions_inner(request: Request):
                     current_uid = None
                     continue
                 except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
-                    logger.error("[stream][%s] server disconnected (retry %d/%d): %s", completion_id, retry_count, MAX_STREAM_RETRIES, e)
+                    # server disconnected — 不消耗主重试预算，直接换号
+                    disconnect_retries += 1
+                    logger.error("[stream][%s] server disconnected (disconnect %d, retry %d/%d): %s", completion_id, disconnect_retries, retry_count, MAX_STREAM_RETRIES, e)
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
                         await client.close()
                         client = None
-                    retry_count += 1
-                    if retry_count >= MAX_STREAM_RETRIES:
-                        error_msg = "上游服务断开连接，请稍后重试"
+                    if disconnect_retries >= MAX_STREAM_RETRIES * 2:
+                        error_msg = "上游服务多次断开连接，请稍后重试"
                         yield f"data: {json.dumps(_openai_chunk(completion_id, model, content=f'[{error_msg}]'), ensure_ascii=False)}\n\n"
                         yield f"data: {json.dumps(_openai_chunk(completion_id, model, finish_reason='error'), ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    logger.info("[stream][%s] switching account and retrying... (%d/%d)", completion_id, retry_count, MAX_STREAM_RETRIES)
+                    logger.info("[stream][%s] switching account immediately... (disconnect %d)", completion_id, disconnect_retries)
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
@@ -1173,13 +1183,18 @@ async def _chat_completions_inner(request: Request):
                     current_uid = None
                     continue
                 except httpx.HTTPStatusError as e:
+                    status_code = e.response.status_code if e.response else 0
                     is_concurrency = False
+                    is_signature = False
+                    err_detail = ""
                     try:
                         err_body = e.response.json() if e.response else {}
                         is_concurrency = err_body.get("code") == 429
+                        err_detail = str(err_body.get("detail", ""))
+                        is_signature = "签名" in err_detail or "Signature" in err_detail
                     except Exception:
                         pass
-                    logger.error("[stream][%s] HTTP %s (concurrency=%s, retry %d/%d): %s", completion_id, e.response.status_code if e.response else '?', is_concurrency, retry_count, MAX_STREAM_RETRIES, e)
+                    logger.error("[stream][%s] HTTP %s (concurrency=%s, signature=%s, retry %d/%d): %s", completion_id, status_code, is_concurrency, is_signature, retry_count, MAX_STREAM_RETRIES, e)
                     if client is not None:
                         if chat_id:
                             await client.delete_chat(chat_id)
@@ -1193,7 +1208,10 @@ async def _chat_completions_inner(request: Request):
                     if is_concurrency:
                         logger.info("[stream][%s] concurrency limit hit, cleaning up chats...", completion_id)
                         await pool.cleanup_chats()
-                        await asyncio.sleep(min(2 ** retry_count, 4))  # exponential backoff, max 4s
+                        await asyncio.sleep(min(2 ** retry_count, 4))
+                    elif is_signature:
+                        # 签名验证失败 — 账号可能过期，立即换号
+                        logger.info("[stream][%s] signature failed, invalidating account and retrying...", completion_id)
                     await pool.refresh_auth(current_uid)
                     current_uid = None
                     continue
