@@ -11,21 +11,21 @@ services:
       - LOG_LEVEL=INFO
       - HTTP_DEBUG=0
       - ENABLE_THINKING=1
-      # ── 超时 ──
+      # ── 超时（防截断/断流） ──
       - UPSTREAM_FIRST_EVENT_TIMEOUT=120
-      - UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX=5
       - TOKEN_MAX_AGE=480
-      # ── 池管理（4C4G 优化） ──
-      - POOL_MIN_SIZE=5
-      - POOL_MAX_SIZE=48
+      # ── 重试（防空回/断流） ──
+      - UPSTREAM_FIRST_EVENT_TIMEOUT_RETRY_MAX=5
+      - MAX_STREAM_RETRIES=5
+      - SSE_HEARTBEAT_INTERVAL=15
+      # ── 池管理（8C8G 拉满） ──
+      - POOL_MIN_SIZE=8
+      - POOL_MAX_SIZE=96
       - POOL_TARGET_INFLIGHT_PER_ACCOUNT=2
       - POOL_MAINTAIN_INTERVAL=10
       - POOL_SCALE_DOWN_IDLE_ROUNDS=3
-      # ── 重试与并发 ──
-      - MAX_STREAM_RETRIES=5
-      - GLOBAL_CONCURRENCY_LIMIT=64
-      # ── SSE 心跳 ──
-      - SSE_HEARTBEAT_INTERVAL=15
+      # ── 并发（8C8G 拉满） ──
+      - GLOBAL_CONCURRENCY_LIMIT=128
     volumes:
       - ./:/app
     command: ["python", "server.py"]
