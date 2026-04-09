@@ -19,8 +19,8 @@ import httpx
 logger = logging.getLogger("zai.client")
 
 BASE_URL = "https://chat.z.ai"
-HMAC_SECRET = os.getenv("HMAC_SECRET", "key-@@@@)))()((9))-xxxx&&&&%%%%%")
-FE_VERSION = "prod-fe-1.0.231"
+HMAC_SECRET = os.getenv("HMAC_SECRET", "key-@@@@)))()((9))-xxxx&&&%%%%%")
+FE_VERSION = os.getenv("FE_VERSION", "prod-fe-1.0.231")
 CLIENT_VERSION = "0.0.1"
 DEFAULT_MODEL = "glm-5"
 ENABLE_THINKING_DEFAULT = os.getenv("ENABLE_THINKING", "1") == "1"
